@@ -56,6 +56,7 @@ from dialogs import (
     _ModelLoadDialog,
 )
 from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
+from translation_cache import TranslationCache
 
 
 def setup_logging():
@@ -180,6 +181,8 @@ class LiveTranslateApp:
         self._tl_executor = ThreadPoolExecutor(max_workers=8)
 
         self._transcript = TranscriptWriter(Path(__file__).parent / "transcripts")
+        self._translation_cache = TranslationCache(max_entries=100000)
+        self._cache_save_timer = None
 
         # Memory diagnostic state
         import psutil
@@ -550,6 +553,22 @@ class LiveTranslateApp:
 
     def _translate_async(self, msg_id, text, source_lang, extra_langs=None):
         """Translate text and update UI with streaming display."""
+        # ── Cache lookup ──
+        target_lang = self._target_language
+        if len(text) >= 3:
+            cached = self._translation_cache.get(text, target_lang)
+            if cached is not None:
+                log.info(f"Cache hit: {cached}")
+                self._transcript.write_translation(msg_id, cached)
+                if self._overlay:
+                    self._overlay.update_translation(msg_id, cached, 0)
+                if self._subwin and self._subwin.isVisible():
+                    tl_dict = {target_lang: cached}
+                    if extra_langs:
+                        self._translate_extra_langs(text, source_lang, extra_langs, tl_dict)
+                    self._subwin.update_text(text, tl_dict)
+                return
+
         try:
             tl_start = time.perf_counter()
             translated = None
@@ -566,6 +585,9 @@ class LiveTranslateApp:
             log.info(f"Translate ({tl_ms:.0f}ms): {translated}")
             if translated:
                 self._transcript.write_translation(msg_id, translated)
+                # Write to cache
+                if len(text) >= 3:
+                    self._translation_cache.put(text, target_lang, translated)
             else:
                 self._transcript.finalize_no_translation(msg_id)
             if self._overlay:
@@ -578,7 +600,7 @@ class LiveTranslateApp:
                     cost,
                 )
             if self._subwin and self._subwin.isVisible() and translated:
-                tl_dict = {self._target_language: translated}
+                tl_dict = {target_lang: translated}
                 if extra_langs:
                     self._translate_extra_langs(text, source_lang, extra_langs, tl_dict)
                 self._subwin.update_text(text, tl_dict)
@@ -656,6 +678,11 @@ class LiveTranslateApp:
             self._mem_periodic_timer = QTimer()
             self._mem_periodic_timer.timeout.connect(self._log_mem_periodic)
             self._mem_periodic_timer.start(30000)
+        # Periodic translation cache save every 5 minutes
+        if self._cache_save_timer is None:
+            self._cache_save_timer = QTimer()
+            self._cache_save_timer.timeout.connect(self._translation_cache.save)
+            self._cache_save_timer.start(300000)
         snap = self._mem_snapshot()
         log.info(
             f"MEM[start] RSS={snap['rss']:.1f}MB "
@@ -692,6 +719,14 @@ class LiveTranslateApp:
         self._interim_committed_tail = ""
         self._tl_executor.shutdown(wait=False)
         self._transcript.close()
+        # Save translation cache and stop periodic save timer
+        if self._cache_save_timer is not None:
+            try:
+                self._cache_save_timer.stop()
+            except Exception:
+                pass
+            self._cache_save_timer = None
+        self._translation_cache.save()
         if self._mem_periodic_timer is not None:
             try:
                 self._mem_periodic_timer.stop()
@@ -1326,6 +1361,8 @@ def main():
         active_model = panel.get_active_model()
         if active_model:
             live_trans._on_model_changed(active_model)
+        # Load translation cache
+        live_trans._translation_cache.load()
 
     QTimer.singleShot(100, _deferred_init)
 
